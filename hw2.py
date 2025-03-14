@@ -1,119 +1,115 @@
 import argparse
 import gymnasium as gym
 import torch
-import torch.nn as nn
 import torch.optim as optim
-import torch.distributions as distributions
 import numpy as np
-from tqdm import tqdm
-from models import PolicyNetwork, ValueNetwork
-from utils import compute_returns
+import os
+from models import PolicyNetwork
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("--algo", type=str, choices=["pg", "pgb", "ppo"], required=True, help="Choose which RL algorithm to run")
-parser.add_argument("--num_episodes", type=int, default=1000, help="Number of training episodes")
-args = parser.parse_args()
+# 确保 results 目录存在
+os.makedirs("results", exist_ok=True)
 
-# Select environment
-env = gym.make("Ant-v4")
+def compute_returns(rewards, gamma=0.99):
+    """
+    计算 Reward-to-Go，并进行归一化
+    """
+    returns = []
+    G = 0
+    for r in reversed(rewards):
+        G = r + gamma * G
+        returns.insert(0, G)
+    returns = torch.tensor(returns, dtype=torch.float32)
+    
+    # 归一化 returns 以减少高方差问题
+    mean = returns.mean()
+    std = returns.std() + 1e-8  # 避免除零错误
+    return (returns - mean) / std
 
-# Get state and action dimensions
-state_dim = env.observation_space.shape[0]
-action_dim = env.action_space.shape[0] if isinstance(env.action_space, gym.spaces.Box) else env.action_space.n
+def save_model(policy, path="results/pg_model.pth"):
+    """
+    保存模型到 results 目录
+    """
+    torch.save(policy.state_dict(), path)
+    print(f"Model saved to {path}")
 
-print(f"Using environment: {env.spec.id}")
-print(f"State dimension: {state_dim}, Action dimension: {action_dim}")
+def save_rewards(rewards, path="results/pg_rewards.npy"):
+    """
+    保存奖励数据到 results 目录
+    """
+    np.save(path, rewards)
+    print(f"Rewards saved to {path}")
 
-# Initialize policy network
-policy = PolicyNetwork(state_dim, action_dim)
-optimizer = optim.Adam(policy.parameters(), lr=1e-3)
+def train_pg(env_name="Ant-v4", num_episodes=1000, gamma=0.99, lr=1e-4, batch_size=5):
+    """
+    训练 Vanilla Policy Gradient (REINFORCE) 
+    """
+    env = gym.make(env_name)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    
+    policy = PolicyNetwork(state_dim, action_dim)
+    optimizer = optim.Adam(policy.parameters(), lr=lr)
 
-# Initialize value network for PGB and PPO
-if args.algo in ["pgb", "ppo"]:
-    value_net = ValueNetwork(state_dim)
-    value_optimizer = optim.Adam(value_net.parameters(), lr=1e-3)
+    episode_rewards = []  # 记录每个 episode 的总奖励
 
-# Store rewards for plotting
-all_rewards = []
+    for episode in range(num_episodes):
+        batch_log_probs = []
+        batch_rewards = []
 
-# Training loop with tqdm progress bar
-progress_bar = tqdm(range(args.num_episodes), desc=f"Training {args.algo.upper()}", unit="episode")
+        # 采样 batch_size 个 trajectories 进行更新
+        for _ in range(batch_size):
+            state, _ = env.reset()
+            log_probs = []
+            rewards = []
+            done = False
 
-for episode in progress_bar:
-    state, _ = env.reset()
-    log_probs, rewards, values = [], [], []
+            while not done:
+                state_tensor = torch.tensor(state, dtype=torch.float32)
+                action, log_prob = policy.sample_action(state_tensor)
+                next_state, reward, terminated, truncated, _ = env.step(action.detach().numpy())
+                done = terminated or truncated
 
-    max_steps = 1000
-    step_count = 0
+                log_probs.append(log_prob)
+                rewards.append(reward)
+                state = next_state
 
-    while True:
-        step_count += 1
-        state_tensor = torch.tensor(state, dtype=torch.float32)
-        action_mean = policy(state_tensor)
-        action_std = torch.ones_like(action_mean) * 0.1
-        action_dist = distributions.Normal(action_mean, action_std)
-        action = action_dist.sample()
-        action = torch.clamp(action, -1, 1)
+            batch_log_probs.append(torch.stack(log_probs))
+            batch_rewards.append(rewards)
 
-        log_probs.append(action_dist.log_prob(action).sum().unsqueeze(0))  # ✅ 确保 log_prob 是 1D
+        # 计算所有轨迹的 Reward-to-Go
+        batch_returns = [compute_returns(r, gamma) for r in batch_rewards]
+        batch_returns = torch.cat(batch_returns)  # 转换成 Tensor
+        batch_log_probs = torch.cat(batch_log_probs)  # 转换成 Tensor
 
-        state, reward, done, _, _ = env.step(action.detach().numpy())
-        rewards.append(reward)
+        # 计算策略梯度损失
+        loss = -torch.sum(batch_log_probs * batch_returns)
 
-        if args.algo in ["pgb", "ppo"]:
-            values.append(value_net(state_tensor).view(-1))  # ✅ 修正 0D Tensor 问题
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-        if done or step_count >= max_steps:
-            break
+        # 记录 batch 内所有 episode 的平均 reward
+        avg_reward = np.mean([sum(r) for r in batch_rewards])
+        episode_rewards.append(avg_reward)
 
-    # Compute returns
-    returns = compute_returns(rewards).detach()
+        if episode % 10 == 0:
+            print(f"Episode {episode}, Average Reward: {avg_reward:.2f}")
 
-    # 🚀 确保 `values` 不是空的
-    if args.algo in ["pgb", "ppo"]:
-        if len(values) == 0:
-            raise RuntimeError("Error: `values` is empty. Ensure value_net is correctly computing V(s).")
-        values = torch.cat(values)  # ✅ 修正 `torch.cat()` 报错
-        advantages = returns - values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    env.close()
 
-    # Compute loss for PG
+    # 保存训练结果
+    save_model(policy)  
+    save_rewards(episode_rewards)
+
+    return episode_rewards
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--algo", type=str, default="pg", choices=["pg", "pgb", "ppo"],
+                        help="Algorithm to run: pg (REINFORCE), pgb (PG with Baseline), ppo (PPO)")
+    parser.add_argument("--num_episodes", type=int, default=1000, help="Number of episodes for training")
+    
+    args = parser.parse_args()
+
     if args.algo == "pg":
-        loss = -torch.mean(torch.stack(log_probs) * returns)
-
-    # Compute loss for PGB
-    elif args.algo == "pgb":
-        loss = -torch.mean(torch.stack(log_probs) * advantages.detach())
-        value_loss = ((returns - values) ** 2).mean()
-
-        value_optimizer.zero_grad()
-        value_loss.backward(retain_graph=True)
-        value_optimizer.step()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    # Compute loss for PPO
-    elif args.algo == "ppo":
-        epsilon = 0.2
-        log_probs = torch.cat(log_probs)
-        old_log_probs = log_probs.detach()
-        ratios = torch.exp(log_probs - old_log_probs)
-
-        clipped_ratios = torch.clamp(ratios, 1 - epsilon, 1 + epsilon)
-        loss = -torch.min(ratios * advantages, clipped_ratios * advantages).mean()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-    all_rewards.append(sum(rewards))
-
-    progress_bar.set_postfix({"Total Reward": sum(rewards)})
-
-# Save rewards for plotting
-np.save(f"results/rewards_{args.algo}.npy", np.array(all_rewards))
-
-print("Training complete!")
+        episode_rewards = train_pg(num_episodes=args.num_episodes)
